@@ -1,0 +1,377 @@
+---
+title: "Debugging the training process"
+output: html_notebook
+---
+
+First, lets get the training data and instantiate the model.
+
+```{r setup}
+# Load required libraries
+library(torch)
+library(ggplot2)
+library(tidyr)
+library(BatchGetSymbols)
+library(dagitty)
+library(zoo)
+
+# Source the file containing the functions and classes
+# source("/home/prasanna/Documents/development/freya/ngc/rtorch/train_cmlp.R")
+source('cmlp.R')
+
+#' Load financial data
+#'
+#' @param symbols Character vector, stock ticker symbols.
+#' @param period Character, period for data retrieval.
+#' @return List of data frames with historical stock prices.
+load_data <- function(symbols, period = "5y") {
+  data <- BatchGetSymbols::BatchGetSymbols(tickers = symbols, first.date = Sys.Date() - as.numeric(gsub("y", "", period)) * 365, last.date = Sys.Date())
+  df <- tibble(ticker = data$df.tickers$ticker, price = data$df.tickers$price.adjusted, date_day = data$df.tickers$ref.date)
+  spread(df, key = ticker, value = price)
+}
+
+#' Normalize financial data
+#'
+#' @param data List of data frames, historical stock prices.
+#' @return List of normalized data frames.
+normalize_data <- function(data) {
+  for (i in 1:range(ncol(data))) {
+    symbol <- colnames(data)[i]
+    print(symbol)
+    if (class(data[[symbol]])=="numeric"){
+      avg_value <- mean(data[[symbol]], na.rm = TRUE)
+      sd_value <- sd(data[[symbol]], na.rm = TRUE)
+      data[[symbol]] <- (data[[symbol]]- avg_value)/sd_value   
+      print("numeric")
+    }
+  }
+  data
+}
+
+#' Create time series tensor
+#'
+#' @param normalized_data List of normalized data frames.
+#' @return Tensor of shape (1, number_timesteps, number_time_series).
+create_time_series_tensor <- function(normalized_data) {
+  normalized_data |> select(-date_day) -> normalized_data
+  min_length <- min(sapply(normalized_data, length))
+  trimmed_data <- lapply(normalized_data, function(x) tail(x, min_length))
+  time_series_data <- do.call(cbind, lapply(trimmed_data, function(x) x[1:min_length]))
+  time_series_data <- t(time_series_data)
+  time_series_data <- array(time_series_data, dim = c(1, nrow(time_series_data), ncol(time_series_data)))
+  torch_tensor(time_series_data, dtype = torch_float32())
+}
+
+# Function to interpolate missing values in numeric columns
+interpolate_na <- function(data) {
+  data[] <- lapply(data, function(x) {
+    if (is.numeric(x)) {
+      na.approx(x, na.rm = FALSE)
+    } else {
+      x
+    }
+  })
+  return(data)
+}
+
+# Load data
+symbols <- c(
+  'TTF=F'
+  #, 'NG=F'
+  #, 'BAYRY', 'VWAGY', '^GDAXI', 'LNG', 'SHEL', 'EURUSD=X'#,
+  #'RUB=X', 'RELIANCE.BO', 'BZ=F', 'MTF=F', 'BP', 
+  #'TTE', 'EONGY', 'RWEOY', 'BASFY', 'SIEGY', 'VWDRY'
+)
+data <- load_data(symbols)
+data[[2]] <- seq(from = nrow(data), to = 1) |> as.numeric()
+#data[[3]] <- seq(1:nrow(data)) |> as.numeric()
+# Normalize data
+normalized_data <- normalize_data(data) |> interpolate_na()
+
+# Create time series tensor
+X <- create_time_series_tensor(normalized_data)
+X$permute(c(1,3,2)) -> X
+
+print(X$shape)
+```
+
+
+Helper functions:
+
+```{r}
+#' Apply ridge penalty at all subsequent layers
+#'
+#' @param network MLP network.
+#' @param lam Numeric, regularization parameter.
+#' @return Numeric, ridge regularization term.
+ridge_regularize <- function(network, lam_ridge) {
+  answer <- 0
+  for (i in 2:length(network$layers)){
+    temp <- torch_sum({network$layers[[i]]$weight ^ 2})
+    answer <- answer + temp
+  }
+  return(lam_ridge * answer)
+}
+
+#' Calculate the loss without falling out of autograd
+#' 
+#' @param networks The networks of the CMLP model
+#' @param loss_fn the torch loss function
+#' @param lam_ridge the regularization parameter
+smooth_loss <- function(networks, loss_fn, lam_ridge, p, X, lag){
+  loss <- 0
+  for (i in 1:p) {
+    loss <- loss + loss_fn(networks[[i]](X[, 1:(dim(X)[2] - 1), ]), X[, (lag+1):dim(X)[2], i, drop = FALSE])
+    # print(paste(i, as.numeric(loss)))
+  }
+  # loss |> print()
+  ridge <- 0
+  for (i in 1:p) {
+    ridge <- ridge + ridge_regularize(networks[[i]], lam_ridge)
+    # print(paste(i, as.numeric(ridge)))
+  }
+  smooth <- loss + ridge
+  return(smooth)
+}
+
+#' Perform proximal update on the first layer weight matrix
+#'
+#' @param network MLP network.
+#' @param lam Numeric, regularization parameter.
+#' @param lr Numeric, learning rate.
+#' @param penalty Character, type of penalty ('GL', 'GSGL', 'H').
+prox_update <- function(network, lam, lr, penalty) {
+  W <- network$layers[[1]]$weight
+  hidden <- W$size(1)
+  p <- W$size(2)
+  lag <- W$size(3)
+  
+  if (penalty == "GL") {
+    norm <- torch_norm(W, dim = c(1, 3), keepdim = TRUE)
+    W <- (W / torch_clamp(norm, min = (lr * lam))) * torch_clamp(norm - (lr * lam), min = 0.0)
+  } else if (penalty == "GSGL") {
+    norm <- torch_norm(W, dim = 1, keepdim = TRUE)
+    W <- (W / torch_clamp(norm, min = (lr * lam))) * torch_clamp(norm - (lr * lam), min = 0.0)
+    norm <- torch_norm(W, dim = c(1, 3), keepdim = TRUE)
+    W <- (W / torch_clamp(norm, min = (lr * lam))) * torch_clamp(norm - (lr * lam), min = 0.0)
+  } else if (penalty == "H") {
+    for (i in seq_len(lag)) {
+      norm <- torch_norm(W[, , 1:i], dim = c(1, 3), keepdim = TRUE)
+      W[, , 1:i] <- (W[, , 1:i] / torch_clamp(norm, min = (lr * lam))) * torch_clamp(norm - (lr * lam), min = 0.0)
+    }
+  } else {
+    stop("Unsupported penalty: ", penalty)
+  }
+}
+
+#' Calculate regularization term for the first layer weight matrix
+#'
+#' @param network MLP network.
+#' @param lam Numeric, regularization parameter.
+#' @param penalty Character, type of penalty ('GL', 'GSGL', 'H').
+#' @return Numeric, regularization term.
+regularize <- function(network, lam, penalty) {
+  W <- network$layers[[1]]$weight
+  hidden <- W$size(1)
+  p <- W$size(2)
+  lag <- W$size(3)
+  
+  if (penalty == "GL") {
+    lam * torch_sum(torch_norm(W, dim = c(1, 3)))
+  } else if (penalty == "GSGL") {
+    lam * (torch_sum(torch_norm(W, dim = c(1, 3))) + torch_sum(torch_norm(W, dim = 1)))
+  } else if (penalty == "H") {
+    temp <- 0
+    for(i in 1:lag){
+      temp <- temp + torch_sum(torch_norm(W[, , 1:i], dim = c(1, 3)))
+    }
+    lam * temp # sum(sapply(seq_len(lag), function(i) torch_sum(torch_norm(W[, , 1:i], dim = c(1, 3)))))
+  } else {
+    stop("Unsupported penalty: ", penalty)
+  }
+}
+
+#' Calculate the mean non smooth loss at check points
+#' 
+#' @param networks The networks for the model
+#' @param lam regularization param
+#' @param penalty which penalty
+nonsmooth_loss <- function(networks, lam, penalty, p) {
+  nonsmooth <- 0
+  for (i in 1:p) {
+    nonsmooth <- nonsmooth + regularize(networks[[i]], lam, penalty)
+  }
+  return(nonsmooth)
+}
+
+
+#' Restore parameters from best_model to model
+#'
+#' @param model MLP model.
+#' @param best_model MLP model with the best parameters.
+restore_parameters <- function(model, best_model) {
+  for (i in 1:length(model$parameters)) {
+    best_params <- best_model$parameters[[i]]
+    model$parameters[[i]] <- best_params
+  }
+}
+```
+
+```{r}
+lr <- 0.001
+max_iter <- 5000
+lam <- 0.000
+lam_ridge <- 0.00
+penalty <-'H'
+lookback <- 10
+check_every <- 10*sqrt(max_iter) |> as.integer()
+verbose <- 1
+lag <- 3
+hidden_layer_units <- c(200)
+activ <- "relu"
+
+# Define cMLP model
+cmlp <- cMLP(num_series = X$shape[3], lag = lag, 
+             hidden = hidden_layer_units, 
+             activation = activ)
+
+a <- (cmlp(X)$detach()) 
+a |> torch_squeeze() |> as.matrix() |> as.numeric() |> tail(5)
+```
+
+
+Now, let us try to run the training script without iterations.
+
+```{r}
+#' Train model with ISTA
+#'
+#' @param cmlp cMLP model.
+#' @param X Tensor, input data.
+#' @param lr Numeric, learning rate.
+#' @param max_iter Integer, maximum number of iterations.
+#' @param lam Numeric, regularization parameter (default: 0).
+#' @param lam_ridge Numeric, ridge regularization parameter (default: 0).
+#' @param penalty Character, type of penalty ('H', default).
+#' @param lookback Integer, lookback period for early stopping (default: 5).
+#' @param check_every Integer, frequency of checks for early stopping (default: 100).
+#' @param verbose Integer, verbosity level (default: 1).
+#' @return Numeric vector, training loss history.
+train_model_ista <- function(cmlp, X, lr, max_iter, lam = 0, lam_ridge = 0, penalty = "H", lookback = 5, check_every = 100, verbose = 1) {
+  
+  lag <- cmlp$lag
+  p <- X$size()[3]
+  loss_fn <- nn_mse_loss(reduction = "mean")
+  train_loss_list <- c()
+  
+  # For early stopping
+  best_it <- NULL
+  best_loss <- Inf
+  best_model <- NULL
+  
+  smooth <- smooth_loss(cmlp$networks, loss_fn, lam_ridge, p, X, lag)
+    
+  for (it in seq_len(max_iter)) {
+  # Take gradient step
+      smooth$backward()
+      
+      for (i in 1:length(cmlp$parameters)) {
+        # print(cmlp$parameters[[i]])
+        with_no_grad({
+          cmlp$parameters[[i]]$sub_(lr * cmlp$parameters[[i]]$grad)
+          cmlp$parameters[[i]]$grad$zero_
+        })
+        # print(cmlp$parameters[[i]])
+      }
+      
+      # Take prox step
+      with_no_grad({
+        if (lam > 0) {
+        for (i in 1:p) {
+          prox_update(cmlp$networks[[i]], lam, lr, penalty)
+          }
+        }
+        cmlp$parameters[[i]]$grad$zero_
+      })
+      
+    # Calculate smooth error
+    smooth <- smooth_loss(cmlp$networks, loss_fn, lam_ridge, p, X, lag)
+    
+    if (((it + 1) %% check_every) == 0) {
+      nonsmooth <- nonsmooth_loss(cmlp$networks, lam, penalty, p)
+      mean_loss <- smooth+nonsmooth
+      # print(mean_loss)
+      train_loss_list <- c(train_loss_list, as.numeric(mean_loss))
+      if (verbose > 0) {
+        print(paste("lam ", lam, "; lr ", lr, "; mean loss ", as.numeric(mean_loss)))
+        variable_util <- cmlp$GC() |> as.matrix() |> mean()
+        print(paste("Variable usage: ", variable_util))
+        print(paste("Fraction of iterations done : ", it/max_iter))
+      }
+      if (as.numeric(mean_loss) < best_loss) {
+        best_loss <- as.numeric(mean_loss)
+        best_it <- it
+        best_model <- cmlp$clone()
+      } 
+      else if (class(best_it) == 'numeric') {
+        if ((it - best_it) < (lookback*check_every)) {
+          if (verbose > 0) {
+            print("Stopping early")
+            break
+          }
+        }
+      }
+    }
+  }
+  
+  result <- list("model" = best_model, "train_loss_list" = train_loss_list)
+  return(result)
+}
+```
+
+Now, lets run this with some fun stuff. 
+
+```{r}
+resul <- train_model_ista(cmlp, X, lr, 
+                          max_iter, lam, lam_ridge, 
+                          penalty, lookback, 
+                          check_every, verbose)
+```
+
+```{r}
+seq(from = 200, to = 190) |> as.numeric() |> as_tibble() -> Yd
+Yd$date_day <- Sys.Date()
+Yd |> normalize_data() |> interpolate_na() -> Yd
+Yd |> create_time_series_tensor() -> Yt
+Yt$permute(c(1,3,2)) -> Yt
+
+a <- (cmlp(Yt)$detach() * sd(seq(from = 2000, to = 1900))) + mean(seq(from = 2000, to = 1900)) 
+a |> torch_squeeze() |> as.matrix() |> as.numeric() |> head(5)
+b <- (resul$model(Yt)$detach()) 
+b |> torch_squeeze() |> as.matrix() |> as.numeric() -> y
+Yt |> torch_squeeze() |> as.matrix() |> as.numeric() -> x
+plot(x[3:length(x)],y, xlim = c(-1,2), ylim = c(-1,2), type = 'p')
+lines(seq(from=min(x), to=max(x),length.out = 100), seq(from=min(x), to=max(x), length.out = 100), type = 'l',)
+```
+
+
+```{r}
+series <- 1
+
+cmlp$networks[[series]](X[, 1:(dim(X)[2]-1), ]) |> dim()
+X[,(lag+1):dim(X)[2], series, drop = FALSE] |> dim()
+cmlp(X[, 1:(dim(X)[2]-1), ]) |> dim()
+
+nnf_mse_loss(resul$model$networks[[series]](X[, 1:(dim(X)[2]-1), ]),
+             X[,(lag+1):dim(X)[2], series, drop = FALSE])
+ridge_regularize(resul$model$networks[[series]], lam_ridge)
+regularize(resul$model$networks[[series]], lam, 'H')
+
+nonsmooth_loss(networks = resul$model$networks, lam = lam, penalty = 'H', p = series)
+smooth_loss(networks = resul$model$networks, loss_fn = nn_mse_loss(reduction = 'mean'), 
+            lam_ridge = lam_ridge, p = series, X = X, lag = lag)
+
+# resul$model$networks[[series]](X[, 1:(dim(X)[2]-1), ])
+
+# X[,(lag+1):dim(X)[2], series, drop = FALSE]
+```
+
+I clearly need to understand the fundamental MLP circuit better, and see why it works in the first place. 

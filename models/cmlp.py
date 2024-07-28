@@ -449,7 +449,7 @@ def train_model_adam(cmlp, X, lr, max_iter, lam=0, lam_ridge=0, penalty='H',
 
 def train_model_ista(cmlp, X, lr, max_iter, lam=0, lam_ridge=0, penalty='H',
                      lookback=5, check_every=100, verbose=1):
-    '''Train model with Adam.'''
+    '''Train model with ista.'''
     lag = cmlp.lag
     p = X.shape[-1]
     loss_fn = nn.MSELoss(reduction='mean')
